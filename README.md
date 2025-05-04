@@ -1,4 +1,5 @@
-# sd-fast
+# diffusers-fast
+
 A compiler for fast Diffusers 
 
 objectives:
@@ -12,5 +13,4 @@ objectives:
 ```
 import torch
 from diffusers import LTXPipeline
-
 ```
