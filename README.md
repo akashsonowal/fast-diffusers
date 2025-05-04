@@ -1,5 +1,5 @@
 # sd-fast
-Stable Diffusion Fast - A compiler for SD HF models
+A compiler for fast LTX model inference
 
 objectives:
 - Learn about Torch Internals and python internals
@@ -7,3 +7,10 @@ objectives:
 
 ## Inspiration
 - https://github.com/chengzeyi/stable-fast
+
+
+```
+import torch
+from diffusers import LTXPipeline
+
+```
