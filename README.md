@@ -1,5 +1,5 @@
 # sd-fast
-A compiler for fast LTX model inference
+A compiler for fast Diffusers 
 
 objectives:
 - Learn about Torch Internals and python internals
