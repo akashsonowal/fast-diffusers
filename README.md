@@ -1,4 +1,4 @@
-# diffusers-fast
+# fast-diffusers
 
 A compiler for fast Diffusers 
 
