@@ -26,8 +26,6 @@ import torch
 from PIL import Image, ImageDraw
 from diffusers.utils import load_image
 
-# from fast_diffusers.compilers.diffusion_pipeline_compiler import compile, CompilationConfig
-
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", type=str, default=MODEL)
@@ -158,4 +156,46 @@ def main():
             kwargs_input["image"] = input_image
         if control_image is not None:
             if input_image is None:
-                kwargs_input["image"] = 
+                kwargs_input["image"] = control_image
+            else:
+                kwargs_input["control_image"] = control_image
+        return kwargs_input
+    
+    # NOTE: Warm it up
+    # The initial calls with trigger compilation and might be very slow
+    # After that, it should be very fast 
+    if args.warmups > 0:
+        print("Begin warmup")
+        for _ in range(args.warmups):
+            _ = model(**get_kwargs_input())
+        print("End warmup")
+
+    # Let's see it!
+    # Note: Progress bar might work incorrectly due to async nature of CUDA.
+    kwargs_inputs = get_kwargs_input()
+    iter_profiler = IterationProfiler()
+    if "callback_on_step_end" in inspect.signature(model).parameters:
+        kwargs_inputs["callback_on_step_end"] = iter_profiler.on_step_end
+    
+    begin = time.time()
+    output_images = model(**kwargs_inputs).images
+    end = time.time()
+
+    # Let's view it in terminal!
+    from fast_diffusers.utils.term_image import print_image 
+
+    for image in output_images:
+        print_image(image, max_width=80)
+    
+    print(f"Inference time: {end - begin:.3f}s")
+    iter_per_sec = iter_profiler.get_iter_per_sec()
+    if iter_per_sec is not None:
+        print(f"Iterations per second: {iter_per_sec:.3f}s")
+    peak_mem = torch.cuda.max_memory_allocated()
+    print(f"Peak memory: {peak_mem / 1024**3:.3f}GiB")
+
+    if args.output_image is not None:
+        output_images[0].save(args.output_image)
+
+if __name__ == "__main__":
+    main()
