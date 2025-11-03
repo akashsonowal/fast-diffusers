@@ -1,32 +1,232 @@
-import time
+MODEL = 'runwayml/stable-diffusion-v1-5'
+VARIANT = None 
+CUSTOM_PIPELINE = None 
+SCHEDULER = 'EulerAncestralDiscreteScheduler'
+LORA = None
+CONROLNET = None
+STEPS = 30
+PROMPT = 'best quality, realistic, unreal engine, 4K, a beautiful girl'
+NEGATIVE_PROMPT = None
+SEED = None
+WARMUPS = 3
+BATCH = 1 
+HEIGHT = None 
+WIDTH = None 
+INPUT_IMAGE = None 
+CONTROL_IMAGE = None 
+OUTPUT_IMAGE = None 
+EXTRA_CALL_KWARGS = None 
+
+import sys 
+import os 
+import importlib 
+import inspect 
+import argparse
+import time 
+import json 
 import torch 
+from PIL import Image, ImageDraw
+from diffusers.utils import load_image
 
-from diffusers import StableDiffusionPipeline, EulerAncestralDiscreteScheduler
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--model', type=str, default=MODEL)
+    parser.add_argument('--variant', type=str, default=VARIANT)
+    parser.add_argument('--custom_pipeline', type=str, default=CUSTOM_PIPELINE)
+    parser.add_argument('--scheduler', type=str, default=SCHEDULER)
+    parser.add_argument('--lora', type=str, default=LORA)
+    parser.add_argument('--controlnet', type=str, default=CONROLNET)
+    parser.add_argument('--steps', type=int, default=STEPS)
+    parser.add_argument('--prompt', type=str, default=PROMPT)
+    parser.add_argument('--negative-prompt', type=str, default=NEGATIVE_PROMPT)
+    parser.add_argument('--seed', type=int, default=SEED)
+    parser.add_argument('--warmups', type=int, default=WARMUPS)
+    parser.add_argument('--batch', type=int, default=BATCH)
+    parser.add_argument('--height', type=int, default=HEIGHT)
+    parser.add_argument('--width', type=int, default=WIDTH)
+    parser.add_argument('--extra-call-kwargs', type=str, default=EXTRA_CALL_KWARGS)
+    parser.add_argument('--input_image', type=str, default=INPUT_IMAGE)
+    parser.add_argument('--control-image', type=str, default=CONTROL_IMAGE)
+    parser.add_argument('--output-image', type=str, default=OUTPUT_IMAGE)
+    parser.add_argument('--quantize', action='store_true')
+    parser.add_argument('--no-fusion', action='store_true')
+    return parser.parse_args()
 
-def load_model():
-    model = StableDiffusionPipeline.from_pretrained(
-        "runwayml/stable-diffusion-v1-5",
-        torch_dtype=torch.float16)
-    model.scheduler = EulerAncestralDiscreteScheduler.from_config(
-        model.scheduler.config)
+def load_model(pipeline_cls,
+            model,
+            variant=None,
+            custom_pipeline=None,
+            scheduler=None,
+            lora=None,
+            controlnet=None):
+    extra_kwargs = {}
+    if custom_pipeline is not None:
+        extra_kwargs['custom_pipeline'] = custom_pipeline
+    if variant is not None:
+        extra_kwargs['variant'] = variant
+    if controlnet is not None:
+        from diffusers import ControlNetModel
+        controlnet_model = ControlNetModel.from_pretrained(controlnet)
+        extra_kwargs['controlnet'] = controlnet_model
+    model = pipeline_cls.from_pretrained(model, 
+                                         **extra_kwargs)
+
+    if scheduler is not None:
+        scheduler_cls = getattr(importlib.import_module('diffusers'), 
+                                scheduler)
+        model.scheduler = scheduler_cls.from_config(model.scheduler.config)
+    
+    if lora is not None:
+        model.load_lora_weights(lora)
+        model.fuse_lora()
+    
     model.safety_checker = None 
-    model.to(torch.device("cuda"))
-    return model 
+    model.to(torch.device('cuda'))
+    return model
 
-model = load_model()
-# model = torch.compile(model, mode="reduce-overhead", fullgraph=True)
+class IterationProfiler:
 
-kwargs_inputs = dict(
-    prompt='(masterpiece:1,2), best quality, masterpiece, best detailed face, a beautiful girl',
-    height=512,
-    width=512,
-    num_inference_steps=30,
-    num_images_per_prompt=1,
-)
+    def __init__(self):
+        self.begin = None 
+        self.end = None 
+        self.num_iterations = 0
+    
+    def get_iter_per_sec(self):
+        if self.begin is None or self.end is None:
+            return None 
+        self.end.synchronize()
+        dur = self.begin.elapsed_time(self.end)
+        return self.num_iterations / dur * 1000.0
 
-for _ in range(3):
-    output_image = model(**kwargs_inputs).images[0]
+    def callback_on_step_end(self, pipe, i, t, callback_kwargs):
+        if self.begin is None:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self.begin = event 
+        else:
+            event = torch.cuda.Event(enable_timing=True)
+            event.record()
+            self.end = event 
+            self.num_iterations += 1 
+        return callback_kwargs
 
-begin = time.time()
-output_image = model(**kwargs_inputs).images[0]
-print(f'Inference time: {time.time() - begin:.3f}s') # 1.928 seconds
+def main():
+    args = parse_args()
+    if args.input_image is None:
+        from diffusers import AutoPipelineForText2Image as pipeline_cls
+    else:
+        from diffusers import AutoPipelineForImage2Image as pipeline_cls
+    
+    model = load_model(
+        pipeline_cls,
+        args.model,
+        variant=args.variant,
+        custom_pipeline=args.custom_pipeline,
+        scheduler=args.scheduler,
+        lora=args.lora,
+        controlnet=args.controlnet,
+    )
+
+    VAE_SCALE_FACTOR = 8
+    height = args.height or model.unet.config.sample_size * VAE_SCALE_FACTOR
+    width = args.width or model.unet.config.sample_size * VAE_SCALE_FACTOR
+
+    if args.quantize:
+        
+        def quantize_unet(m):
+            from diffusers.utils import USE_PEFT_BACKEND
+            assert USE_PEFT_BACKEND
+            m = torch.quantization.quantize_dynamic(m, {torch.nn.Linear}, 
+                                                    dtype=torch.qint8,
+                                                    inplace=True)
+            return m 
+        
+        model.unet = quantize_unet(model.unet)
+        if hasattr(model, 'controlnet'):
+            model.controlnet = quantize_unet(model.controlnet)
+    
+    if args.no_fusion:
+        torch.jit.set_fusion_strategy([('STATIC', 0), ('DYNAMIC', 0)])
+    
+    if args.input_image is None:
+        input_image = None
+    else:
+        input_image = load_image(args.input_image)
+        input_image = input_image.resize((width, height), 
+                                         Image.LANCZOS)
+    
+    if args.control_image is None:
+        if args.controlnet is None:
+            control_image = None
+        else:
+            control_image = Image.new('RGB', (width, height))
+            draw = ImageDraw.Draw(control_image)
+            draw.ellipse((width // 4, height // 4,
+                         width //4  * 3, height // 4 * 3),
+                        fill=(255, 255, 255))
+            del draw
+    else:
+        control_image = load_image(args.control_image)
+        control_image = control_image.resize((width, height), Image.LANCZOS)
+
+    def get_kwargs_input():
+        kwargs_input = dict(
+            prompt=args.prompt,
+            negative_prompt=args.negative_prompt,
+            height=height,
+            width=width,
+            num_inference_steps=args.steps,
+            num_images_per_prompt=args.batch,
+            generator=None if args.seed is None else torch.Generator(
+                device='cuda').manual_seed(args.seed),
+            **(dict() if args.extra_call_kwargs is None else json.loads(
+                args.extra_call_kwargs)),
+        )
+        if input_image is not None:
+            kwargs_input['image'] = input_image
+        if control_image is not None:
+            if input_image is None:
+                kwargs_input['image'] = control_image
+            else:
+                kwargs_input['control_image'] = control_image
+        return kwargs_input
+    
+    # NOTE: Warm it up
+    # The initial calls with trigger compilation and might be very slow
+    # After that, it should be very fast 
+    if args.warmups > 0:
+        print('Begin warmup')
+        for _ in range(args.warmups):
+            _ = model(**get_kwargs_input())
+        print('End warmup')
+
+    # Let's see it!
+    # Note: Progress bar might work incorrectly due to async nature of CUDA.
+    kwargs_inputs = get_kwargs_input()
+    iter_profiler = IterationProfiler()
+    if 'callback_on_step_end' in inspect.signature(model).parameters:
+        kwargs_inputs['callback_on_step_end'] = iter_profiler.callback_on_step_end
+    
+    begin = time.time()
+    output_images = model(**kwargs_inputs).images
+    end = time.time()
+
+    # Let's view it in terminal!
+    sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../src'))
+    from fast_diffusers.utils.term_image import print_image 
+
+    for image in output_images:
+        print_image(image, max_width=80)
+    
+    print(f'Inference time: {end - begin:.3f}s')
+    iter_per_sec = iter_profiler.get_iter_per_sec()
+    if iter_per_sec is not None:
+        print(f'Iterations per second: {iter_per_sec:.3f}s')
+    peak_mem = torch.cuda.max_memory_allocated()
+    print(f'Peak memory: {peak_mem / 1024**3:.3f}GiB')
+
+    if args.output_image is not None:
+        output_images[0].save(args.output_image)
+
+if __name__ == '__main__':
+    main()
